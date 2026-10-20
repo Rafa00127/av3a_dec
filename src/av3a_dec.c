@@ -495,17 +495,18 @@ static DWORD WINAPI av3a_job_thread(LPVOID param)
 
 static void av3a_job_stop(void)
 {
-    if (g_job_cs_ready) EnterCriticalSection(&g_job_cs);
+    if (!g_job_cs_ready) return;
     InterlockedExchange(&g_job.stop, 1);
     if (g_job.thread) {
         WaitForSingleObject(g_job.thread, 8000);
         CloseHandle(g_job.thread);
         g_job.thread = NULL;
     }
+    EnterCriticalSection(&g_job_cs);
     if (g_job.out) { fclose(g_job.out); g_job.out = NULL; }
     if (!g_job.is_cache && g_job.temp_path[0]) DeleteFileA(g_job.temp_path);
-    if (g_job_cs_ready) LeaveCriticalSection(&g_job_cs);
     memset(&g_job, 0, sizeof(g_job));
+    LeaveCriticalSection(&g_job_cs);
 }
 
 
@@ -598,7 +599,7 @@ EXPORT const wchar_t* av3a_prepare(const wchar_t* path)
     }
 
     /* wait until ~1 second of audio is ready (or the decode ends) */
-    while (!g_job.eof && g_job.produced < 44 + (unsigned long long)OUT_RATE * OUT_CH * 2) {
+    while (!g_job.eof && g_job.produced < 44 + (unsigned long long)OUT_RATE * OUT_CH * 2 * 10) {
         Sleep(10);
     }
 
