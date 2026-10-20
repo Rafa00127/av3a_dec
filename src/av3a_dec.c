@@ -599,7 +599,7 @@ EXPORT const wchar_t* av3a_prepare(const wchar_t* path)
     }
 
     /* wait until ~1 second of audio is ready (or the decode ends) */
-    while (!g_job.eof && g_job.produced < 44 + (unsigned long long)OUT_RATE * OUT_CH * 2 * 10) {
+    while (!g_job.eof && g_job.produced < 44 + (unsigned long long)OUT_RATE * OUT_CH * 2 * 2) {
         Sleep(10);
     }
 
