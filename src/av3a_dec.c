@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "avs3_prot_dec.h"
 #include "avs3_stat_dec.h"
@@ -20,6 +21,7 @@
 
 #define OUT_RATE 44100
 #define OUT_CH 2
+
 #define EXPORT __declspec(dllexport)
 
 extern const char *g_av3a_model_path;
@@ -149,6 +151,40 @@ static int extract_es(const char *src, const char *dst)
     free(d);
     g_data = NULL;
     return (sample == count) ? 0 : -1;
+}
+
+
+/* simple output gain + clamp for the matrix downmix */
+typedef struct { float gain; float env[2]; float rel; } PostState;
+
+static void post_init(PostState* p, int rate)
+{
+    (void)rate;
+    p->gain = 1.25f;  /* +1.9 dB, tamed by the peak limiter */
+    p->env[0] = p->env[1] = 0.0f;
+    p->rel = expf(-1.0f / (0.15f * rate));
+}
+
+static void post_process(PostState* p, short* stereo, int frames)
+{
+    for (int i = 0; i < frames; ++i) {
+        float l = stereo[i * 2] / 32768.0f;
+        float r = stereo[i * 2 + 1] / 32768.0f;
+        float m = (l + r) * 0.5f;
+        float s = (l - r) * 0.5f * 0.68f;
+        float lr[2] = { m + s, m - s };
+        for (int c = 0; c < 2; ++c) {
+            int idx = i * 2 + c;
+            float x = lr[c] * p->gain;
+            float a = x < 0 ? -x : x;
+            if (a > p->env[c]) p->env[c] = a; else p->env[c] *= p->rel;
+            float g = p->env[c] > 0.95f ? 0.95f / p->env[c] : 1.0f;
+            x *= g;
+            if (x > 1.0f) x = 1.0f;
+            if (x < -1.0f) x = -1.0f;
+            stereo[idx] = (short)(x * 32767.0f);
+        }
+    }
 }
 
 static void downmix(const short *in, int channels, int frames, short *out)
@@ -455,11 +491,14 @@ static DWORD WINAPI av3a_job_thread(LPVOID param)
         st->frame_len = dec->frameLength;
     }
 
+    PostState post;
+    post_init(&post, OUT_RATE);
     while (!st->stop && pcm && stereo && ReadBitstream(dec, fIn) != 0) {
         unsigned bytes = (unsigned)st->frame_len * 2 * sizeof(short);
         Avs3Decode(dec, pcm);
         ResetBitstream(dec->hBitstream);
         downmix(pcm, st->channels, st->frame_len, stereo);
+        post_process(&post, stereo, st->frame_len);
         if (st->produced + bytes > st->capacity) break;
         EnterCriticalSection(&g_job_cs);
         if (st->out) {
