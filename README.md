@@ -5,7 +5,7 @@ AVS3-P3（Audio Vivid，MP4 中 `av3a` 音轨）解码 DLL，供 MusicPlayer2 �
 
 - 外壳代码：`src/av3a_dec.c`（MP4 抽帧、12 声道下混、WAV/缓存/流式接口）
 - 解码核心：`src/codec`，来自 AVS/UWA 的 `AVS3A_RMV4.0` 参考解码器
-- 模型：不随仓库分发。DLL 会依次查找同目录的 `model.bin`、`vivid_model.bin`；前者来自 AudioVivid 参考包，后者可直接用网易云客户端的 `resource\vivid_model.bin`
+- 模型：不随仓库分发，获取方式见下文「模型」
 
 ## 构建
 
@@ -24,6 +24,23 @@ make
 ```
 
 产物：当前目录 `av3a_dec.dll`。
+
+## 模型（需自备，不随仓库分发）
+
+DLL 会在自身目录依次查找 `model.bin`、`vivid_model.bin`，任选其一放入即可。
+获取方式二选一：
+
+1. AudioVivid 参考包（推荐）
+   - UWA 下载页：https://www.theuwa.com/download/2?page=2
+   - 或镜像包：https://github.com/6hzzz/AVS3stream 的 `TS/AudioVivid源码.7z`
+   - 解压后位于 `AVS3A_Codec_linux/avs3RM0Decoder/model.bin`
+     （或 `AVS3A_RMV4.0/AVS3A_RMV4.0/AVS3_Codec/avs3RM0Decoder/model.bin`）
+2. 已安装的网易云客户端
+   - `<安装目录>\resource\vivid_model.bin`
+     （常见：`C:\Program Files (x86)\NetEase\CloudMusic\resource`、`E:\CloudMusic\resource`）
+   - 可直接使用原名，或改名为 `model.bin`
+
+该模型仅供本地使用，请勿再分发。
 
 ## 使用
 
