@@ -253,60 +253,6 @@ EXPORT int av3a_probe(const wchar_t *path)
 }
 
 
-static unsigned long long fnv64(const void* data, size_t n, unsigned long long h)
-{
-    const unsigned char* p = (const unsigned char*)data;
-    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ULL; }
-    return h;
-}
-
-static int cache_path_for(const wchar_t* src, char* out, size_t out_n)
-{
-    WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (!GetFileAttributesExW(src, GetFileExInfoStandard, &fad)) return 0;
-
-    unsigned long long h = 1469598103934665603ULL;
-    h = fnv64(src, wcslen(src) * sizeof(wchar_t), h);
-    h = fnv64(&fad.ftLastWriteTime, sizeof(fad.ftLastWriteTime), h);
-    h = fnv64(&fad.nFileSizeLow, sizeof(fad.nFileSizeLow), h);
-    h = fnv64(&fad.nFileSizeHigh, sizeof(fad.nFileSizeHigh), h);
-
-    char dir[MAX_PATH];
-    if (!GetEnvironmentVariableA("LOCALAPPDATA", dir, MAX_PATH)) return 0;
-    snprintf(out, out_n, "%s\\av3a_cache", dir);
-    CreateDirectoryA(out, NULL);
-    snprintf(out, out_n, "%s\\av3a_cache\\%016llx.wav", dir, h);
-    return 1;
-}
-
-static int load_cache(const char* path, void** data, unsigned* size)
-{
-    FILE* f = fopen(path, "rb");
-    if (!f) return 0;
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (n <= 44) { fclose(f); return 0; }
-    unsigned char* d = (unsigned char*)malloc((size_t)n);
-    if (!d) { fclose(f); return 0; }
-    if (fread(d, 1, (size_t)n, f) != (size_t)n) { free(d); fclose(f); return 0; }
-    fclose(f);
-    *data = d;
-    *size = (unsigned)n;
-    return 1;
-}
-
-static void save_cache(const char* path, const void* data, unsigned size)
-{
-    char tmp[MAX_PATH + 8];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    FILE* f = fopen(tmp, "wb");
-    if (!f) return;
-    if (fwrite(data, 1, size, f) != size) { fclose(f); DeleteFileA(tmp); return; }
-    fclose(f);
-    MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING);
-}
-
 EXPORT int av3a_decode_wav(const wchar_t *path, void **data, unsigned *size)
 {
     resolve_model();
@@ -314,10 +260,6 @@ EXPORT int av3a_decode_wav(const wchar_t *path, void **data, unsigned *size)
     *data = NULL;
     *size = 0;
 
-    char cache[MAX_PATH + 16];
-    int has_cache = cache_path_for(path, cache, sizeof(cache));
-    if (has_cache && load_cache(cache, data, size))
-        return 0;
 
     char dllpath[MAX_PATH];
     char modelpath[MAX_PATH];
@@ -411,8 +353,6 @@ EXPORT int av3a_decode_wav(const wchar_t *path, void **data, unsigned *size)
 
     *data = wav;
     *size = (unsigned)(44 + g_pcm_size);
-    if (has_cache)
-        save_cache(cache, wav, *size);
     return 0;
 }
 
@@ -434,10 +374,7 @@ typedef struct Av3aJob {
     unsigned long long capacity, produced;
     char src_path[MAX_PATH];
     char es_path[MAX_PATH];
-    char temp_path[MAX_PATH];
-    char cache_path[MAX_PATH + 16];
-    int is_cache;
-    FILE* out;
+    unsigned char* buf;
 } Av3aJob;
 
 static Av3aJob g_job;
@@ -471,6 +408,7 @@ static DWORD WINAPI av3a_job_thread(LPVOID param)
     short* pcm = NULL;
     short* stereo = NULL;
     char tmppath[MAX_PATH];
+    PostState post;
 
     if (extract_es(st->src_path, st->es_path) != 0) { }
     snprintf(tmppath, sizeof(tmppath), "%s.nul", st->es_path);
@@ -491,7 +429,6 @@ static DWORD WINAPI av3a_job_thread(LPVOID param)
         st->frame_len = dec->frameLength;
     }
 
-    PostState post;
     post_init(&post, OUT_RATE);
     while (!st->stop && pcm && stereo && ReadBitstream(dec, fIn) != 0) {
         unsigned bytes = (unsigned)st->frame_len * 2 * sizeof(short);
@@ -501,11 +438,7 @@ static DWORD WINAPI av3a_job_thread(LPVOID param)
         post_process(&post, stereo, st->frame_len);
         if (st->produced + bytes > st->capacity) break;
         EnterCriticalSection(&g_job_cs);
-        if (st->out) {
-            fseek(st->out, (long)st->produced, SEEK_SET);
-            fwrite(stereo, 1, bytes, st->out);
-            fflush(st->out);
-        }
+        memcpy(st->buf + st->produced, stereo, bytes);
         st->produced += bytes;
         st->frames_done++;
         LeaveCriticalSection(&g_job_cs);
@@ -519,14 +452,6 @@ static DWORD WINAPI av3a_job_thread(LPVOID param)
     free(dec);
     DeleteFileA(st->es_path);
     DeleteFileA(tmppath);
-
-    EnterCriticalSection(&g_job_cs);
-    if (st->produced == st->capacity && st->cache_path[0]) {
-        fclose(st->out);
-        st->out = NULL;
-        CopyFileA(st->temp_path, st->cache_path, FALSE);
-    }
-    LeaveCriticalSection(&g_job_cs);
 
     InterlockedExchange(&st->eof, 1);
     return 0;
@@ -542,39 +467,19 @@ static void av3a_job_stop(void)
         g_job.thread = NULL;
     }
     EnterCriticalSection(&g_job_cs);
-    if (g_job.out) { fclose(g_job.out); g_job.out = NULL; }
-    if (!g_job.is_cache && g_job.temp_path[0]) DeleteFileA(g_job.temp_path);
+    free(g_job.buf);
     memset(&g_job, 0, sizeof(g_job));
     LeaveCriticalSection(&g_job_cs);
 }
 
-
-static void cleanup_stale_temp(void)
+EXPORT void* av3a_stream_open(const wchar_t* path)
 {
-    char dir[MAX_PATH], pattern[MAX_PATH];
-    GetTempPathA(MAX_PATH, dir);
-    snprintf(pattern, sizeof(pattern), "%sav3a_job_*", dir);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        char full[MAX_PATH * 2];
-        snprintf(full, sizeof(full), "%s%s", dir, fd.cFileName);
-        DeleteFileA(full);
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
-}
-
-EXPORT const wchar_t* av3a_prepare(const wchar_t* path)
-{
-    resolve_model();
     if (!path) return NULL;
     if (!g_job_cs_ready) {
         if (InterlockedCompareExchange(&g_job_cs_ready, 1, 0) == 0)
             InitializeCriticalSection(&g_job_cs);
     }
     av3a_job_stop();
-    cleanup_stale_temp();
 
     char src[MAX_PATH];
     WideCharToMultiByte(CP_ACP, 0, path, -1, src, MAX_PATH, NULL, NULL);
@@ -589,28 +494,16 @@ EXPORT const wchar_t* av3a_prepare(const wchar_t* path)
     g_job.produced = 44;
     g_job.frame_len = 1024;
     g_job.channels = 12;
-    g_job.total_frames = frames;
 
     char tmpdir[MAX_PATH];
     GetTempPathA(MAX_PATH, tmpdir);
     snprintf(g_job.es_path, sizeof(g_job.es_path), "%sav3a_job_%lu.av3a", tmpdir, (unsigned long)GetCurrentProcessId());
-    snprintf(g_job.temp_path, sizeof(g_job.temp_path), "%sav3a_job_%lu_%lu.wav", tmpdir,
-             (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount());
 
-    if (cache_path_for(path, g_job.cache_path, sizeof(g_job.cache_path))) {
-        FILE* cf = fopen(g_job.cache_path, "rb");
-        if (cf) {
-            fclose(cf);
-            g_job.is_cache = 1;
-            MultiByteToWideChar(CP_ACP, 0, g_job.cache_path, -1, g_return_path, MAX_PATH);
-            return g_return_path;
-        }
-    }
+    unsigned char* buf = (unsigned char*)calloc(1, (size_t)total);
+    if (!buf) return NULL;
+    g_job.buf = buf;
 
-    FILE* f = fopen(g_job.temp_path, "w+b");
-    if (!f) return NULL;
-
-    unsigned char h[44] = {0};
+    unsigned char* h = buf;
     memcpy(h, "RIFF", 4);
     put_le32(h + 4, (unsigned)(36 + pcm_bytes));
     memcpy(h + 8, "WAVEfmt ", 8);
@@ -623,32 +516,41 @@ EXPORT const wchar_t* av3a_prepare(const wchar_t* path)
     put_le16(h + 34, 16);
     memcpy(h + 36, "data", 4);
     put_le32(h + 40, (unsigned)pcm_bytes);
-    fwrite(h, 1, 44, f);
-    fflush(f);
-    /* preallocate final size so the file is seekable while decoding */
-    _chsize_s(_fileno(f), (long long)total);
 
-    g_job.out = f;
     g_job.thread = CreateThread(NULL, 0, av3a_job_thread, &g_job, 0, NULL);
     if (!g_job.thread) {
-        fclose(f);
-        g_job.out = NULL;
-        DeleteFileA(g_job.temp_path);
+        free(g_job.buf);
+        memset(&g_job, 0, sizeof(g_job));
         return NULL;
     }
 
-    /* wait until ~1 second of audio is ready (or the decode ends) */
     while (!g_job.eof && g_job.produced < 44 + (unsigned long long)OUT_RATE * OUT_CH * 2 * 2) {
         Sleep(10);
     }
-
-    MultiByteToWideChar(CP_ACP, 0, g_job.temp_path, -1, g_return_path, MAX_PATH);
-    return g_return_path;
+    return &g_job;
 }
 
-EXPORT void av3a_cleanup(void)
+EXPORT unsigned long long av3a_stream_length(void* handle)
+{
+    Av3aJob* st = (Av3aJob*)handle;
+    return st ? st->capacity : 0;
+}
+
+EXPORT int av3a_stream_read(void* handle, void* buf, unsigned len, unsigned long long offset)
+{
+    Av3aJob* st = (Av3aJob*)handle;
+    if (!st || !buf || !st->buf) return 0;
+    if (offset >= st->capacity) return 0;
+    unsigned long long end = offset + len;
+    if (end > st->capacity) end = st->capacity;
+    memcpy(buf, st->buf + offset, (size_t)(end - offset));
+    return (int)(end - offset);
+}
+
+EXPORT void av3a_stream_close(void* handle)
 {
     if (!g_job_cs_ready) return;
+    (void)handle;
     av3a_job_stop();
 }
 
