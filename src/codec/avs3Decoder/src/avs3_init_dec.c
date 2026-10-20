@@ -32,6 +32,8 @@
 
 ==================================================================================================================== */
 
+const char *g_av3a_model_path = 0;
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -484,7 +486,8 @@ void Avs3InitDecoder(AVS3DecoderHandle hAvs3Dec, FILE** fModel)
 #endif
 
     hAvs3Dec->modelType = HYPER;
-    if ((*fModel = fopen("model.bin", "rb")) == NULL)
+    const char* modelPath = g_av3a_model_path ? g_av3a_model_path : "model.bin";
+    if ((*fModel = fopen(modelPath, "rb")) == NULL)
     {
         fprintf(stderr, "Can not open model file.\n");
         exit(-1);

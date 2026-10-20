@@ -5,7 +5,7 @@ AVS3-P3（Audio Vivid，MP4 中 `av3a` 音轨）解码 DLL，供 MusicPlayer2 �
 
 - 外壳代码：`src/av3a_dec.c`（MP4 抽帧、12 声道下混、WAV/缓存/流式接口）
 - 解码核心：`src/codec`，来自 AVS/UWA 的 `AVS3A_RMV4.0` 参考解码器
-- 模型：`model.bin` 不在本仓库中，需自行从 AudioVivid 参考包获取并放到 DLL 同目录
+- 模型：不随仓库分发。DLL 会依次查找同目录的 `model.bin`、`vivid_model.bin`；前者来自 AudioVivid 参考包，后者可直接用网易云客户端的 `resource\vivid_model.bin`
 
 ## 构建
 
@@ -27,7 +27,7 @@ make
 
 ## 使用
 
-把 `av3a_dec.dll` 和 `model.bin` 放到播放器可执行文件同目录即可。导出的 C 接口：
+把 `av3a_dec.dll` 和模型文件（`model.bin` 或 `vivid_model.bin`）放到播放器可执行文件同目录即可。导出的 C 接口：
 
 ```c
 int            av3a_probe(const wchar_t* path);                 // 1 = av3a m4a

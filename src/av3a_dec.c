@@ -22,6 +22,9 @@
 #define OUT_CH 2
 #define EXPORT __declspec(dllexport)
 
+extern const char *g_av3a_model_path;
+static char g_model_path[MAX_PATH];
+
 static void dll_dir(char *out, DWORD n)
 {
     HMODULE mod = NULL;
@@ -30,6 +33,24 @@ static void dll_dir(char *out, DWORD n)
     GetModuleFileNameA(mod, out, n);
     char *slash = strrchr(out, '\\');
     if (slash) *slash = 0;
+}
+
+
+static void resolve_model(void)
+{
+    if (g_av3a_model_path != NULL) return;
+    char dir[MAX_PATH], p1[MAX_PATH], p2[MAX_PATH];
+    dll_dir(dir, MAX_PATH);
+    snprintf(p1, sizeof(p1), "%s\\model.bin", dir);
+    snprintf(p2, sizeof(p2), "%s\\vivid_model.bin", dir);
+    FILE *f = fopen(p1, "rb");
+    if (f) { fclose(f); snprintf(g_model_path, sizeof(g_model_path), "%s", p1); }
+    else {
+        f = fopen(p2, "rb");
+        if (f) { fclose(f); snprintf(g_model_path, sizeof(g_model_path), "%s", p2); }
+        else return;
+    }
+    g_av3a_model_path = g_model_path;
 }
 
 static unsigned be32(const unsigned char *p) { return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
@@ -252,6 +273,7 @@ static void save_cache(const char* path, const void* data, unsigned size)
 
 EXPORT int av3a_decode_wav(const wchar_t *path, void **data, unsigned *size)
 {
+    resolve_model();
     if (!data || !size) return -1;
     *data = NULL;
     *size = 0;
@@ -505,6 +527,7 @@ static void cleanup_stale_temp(void)
 
 EXPORT const wchar_t* av3a_prepare(const wchar_t* path)
 {
+    resolve_model();
     if (!path) return NULL;
     if (!g_job_cs_ready) {
         if (InterlockedCompareExchange(&g_job_cs_ready, 1, 0) == 0)
@@ -593,9 +616,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     (void)inst; (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
-        char dir[MAX_PATH];
-        dll_dir(dir, MAX_PATH);
-        SetCurrentDirectoryA(dir);
+        resolve_model();
     }
     return TRUE;
 }
