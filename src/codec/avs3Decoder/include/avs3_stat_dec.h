@@ -204,6 +204,11 @@ typedef struct avs3_main_decoder_structure
     /* Bitstream buffer */
     AVS3_BSTEREAM_DATA_DEC_HANDLE hBitstream;
 
+    /* optional memory input; when set, file reads are served from this buffer */
+    unsigned char* memData;
+    unsigned long memSize;
+    unsigned long memPos;
+
     /* HOA */
     AVS3_HOA_DEC_DATA_HANDLE hDecHoa;
 

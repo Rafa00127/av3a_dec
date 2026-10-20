@@ -98,39 +98,38 @@ static int has_av3a_entry(const unsigned char *d, size_t n)
     return memcmp(entry + 4, "av3a", 4) == 0;
 }
 
-static int extract_es(const char *src, const char *dst)
+static unsigned char* extract_es_mem(const char* src, size_t* out_size)
 {
-    FILE *f = fopen(src, "rb");
-    if (!f) return -1;
+    FILE* f = fopen(src, "rb");
+    if (!f) return NULL;
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    unsigned char *d = (unsigned char *)malloc((size_t)n);
-    if (!d || fread(d, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(d); return -1; }
+    unsigned char* d = (unsigned char*)malloc((size_t)n);
+    if (!d || fread(d, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(d); return NULL; }
     fclose(f);
 
-    g_data = d; g_size = (size_t)n;
-
-    const unsigned char *stsz = find_box(d, d + n, "stsz", 0);
-    const unsigned char *stco = find_box(d, d + n, "stco", 0);
-    const unsigned char *co64 = find_box(d, d + n, "co64", 0);
-    const unsigned char *stsc = find_box(d, d + n, "stsc", 0);
-    if (!stsz || (!stco && !co64) || !stsc) { free(d); return -1; }
+    const unsigned char* stsz = find_box(d, d + n, "stsz", 0);
+    const unsigned char* stco = find_box(d, d + n, "stco", 0);
+    const unsigned char* co64 = find_box(d, d + n, "co64", 0);
+    const unsigned char* stsc = find_box(d, d + n, "stsc", 0);
+    if (!stsz || (!stco && !co64) || !stsc) { free(d); return NULL; }
 
     unsigned fixed = be32(stsz + 12);
     unsigned count = be32(stsz + 16);
-    const unsigned char *size_tab = stsz + 20;
-    const unsigned char *chunk_box = stco ? stco : co64;
+    const unsigned char* size_tab = stsz + 20;
+    const unsigned char* chunk_box = stco ? stco : co64;
     unsigned nchunks = be32(chunk_box + 12);
-    const unsigned char *chunk_tab = chunk_box + 16;
+    const unsigned char* chunk_tab = chunk_box + 16;
     int chunk64 = (co64 != NULL);
     unsigned nsc = be32(stsc + 12);
-    const unsigned char *sc_tab = stsc + 16;
+    const unsigned char* sc_tab = stsc + 16;
 
-    FILE *o = fopen(dst, "wb");
-    if (!o) { free(d); return -1; }
-
+    unsigned char* out = (unsigned char*)malloc((size_t)n);
+    if (!out) { free(d); return NULL; }
+    size_t pos = 0;
     unsigned sample = 0;
+
     for (unsigned ci = 1; ci <= nchunks && sample < count; ci++) {
         unsigned per_chunk = 0;
         for (unsigned j = 0; j < nsc; j++) {
@@ -141,18 +140,18 @@ static int extract_es(const char *src, const char *dst)
         unsigned long long off = chunk64 ? be64(chunk_tab + (ci - 1) * 8) : be32(chunk_tab + (ci - 1) * 4);
         for (unsigned k = 0; k < per_chunk && sample < count; k++) {
             unsigned ssz = fixed ? fixed : be32(size_tab + sample * 4);
-            if (off + ssz > g_size) break;
-            fwrite(d + off, 1, ssz, o);
+            if (off + ssz > (unsigned long long)n) break;
+            memcpy(out + pos, d + off, ssz);
+            pos += ssz;
             off += ssz;
             sample++;
         }
     }
-    fclose(o);
     free(d);
-    g_data = NULL;
-    return (sample == count) ? 0 : -1;
+    if (sample != count) { free(out); return NULL; }
+    *out_size = pos;
+    return out;
 }
-
 
 /* simple output gain + clamp for the matrix downmix */
 typedef struct { float gain; float env[2]; float rel; } PostState;
@@ -260,36 +259,21 @@ EXPORT int av3a_decode_wav(const wchar_t *path, void **data, unsigned *size)
     *data = NULL;
     *size = 0;
 
-
-    char dllpath[MAX_PATH];
-    char modelpath[MAX_PATH];
-    dll_dir(dllpath, MAX_PATH);
-    snprintf(modelpath, sizeof(modelpath), "%s\\model.bin", dllpath);
-
-    char src[MAX_PATH], tmppath[MAX_PATH], espath[MAX_PATH];
+    char src[MAX_PATH];
     WideCharToMultiByte(CP_ACP, 0, path, -1, src, MAX_PATH, NULL, NULL);
-    char tmpdir[MAX_PATH];
-    GetTempPathA(MAX_PATH, tmpdir);
-    snprintf(espath, sizeof(espath), "%sav3a_dll_%lu.av3a", tmpdir, (unsigned long)GetCurrentProcessId());
-    snprintf(tmppath, sizeof(tmppath), "%sav3a_dll_%lu.nul", tmpdir, (unsigned long)GetCurrentProcessId());
 
-    if (extract_es(src, espath) != 0) {
-        DeleteFileA(espath);
-        return -2;
-    }
+    size_t es_size = 0;
+    unsigned char* es = extract_es_mem(src, &es_size);
+    if (!es) return -2;
 
-    AVS3DecoderHandle dec = (AVS3DecoderHandle)malloc(sizeof(AVS3Decoder));
-    if (!dec) { DeleteFileA(espath); return -3; }
+    AVS3DecoderHandle dec = (AVS3DecoderHandle)calloc(1, sizeof(AVS3Decoder));
+    if (!dec) { free(es); return -3; }
+    dec->memData = es;
+    dec->memSize = (unsigned long)es_size;
+    dec->memPos = 0;
 
-    FILE *fIn = NULL, *fOut = NULL, *fModel = NULL;
-    char *dargv[5];
-    dargv[0] = (char *)"av3a_dec";
-    dargv[1] = (char *)"-if";
-    dargv[2] = espath;
-    dargv[3] = (char *)"-of";
-    dargv[4] = tmppath;
-
-    GetAvs3DecoderCommandLine(dec, 5, dargv, &fIn, &fOut);
+    FILE* fModel = NULL;
+    Avs3ParseBsFrameHeader(dec, NULL, 1, NULL);
     Avs3InitDecoder(dec, &fModel);
 
     int channels = dec->numChansOutput;
@@ -301,30 +285,27 @@ EXPORT int av3a_decode_wav(const wchar_t *path, void **data, unsigned *size)
     if (!pcm || !stereo) {
         if (pcm) free(pcm);
         if (stereo) free(stereo);
-        if (fIn) fclose(fIn);
-        if (fOut) fclose(fOut);
         if (fModel) fclose(fModel);
         free(dec);
-        DeleteFileA(espath);
-        DeleteFileA(tmppath);
+        free(es);
         return -4;
     }
 
-    while (ReadBitstream(dec, fIn) != 0) {
+    PostState post;
+    post_init(&post, OUT_RATE);
+    while (ReadBitstream(dec, NULL) != 0) {
         Avs3Decode(dec, pcm);
         ResetBitstream(dec->hBitstream);
         downmix(pcm, channels, frame_len, stereo);
+        post_process(&post, stereo, frame_len);
         if (pcm_append(stereo, (size_t)frame_len * 2) != 0) break;
     }
 
-    if (fIn) fclose(fIn);
-    if (fOut) fclose(fOut);
     if (fModel) fclose(fModel);
     free(pcm);
     free(stereo);
     free(dec);
-    DeleteFileA(espath);
-    DeleteFileA(tmppath);
+    free(es);
 
     if (g_pcm_size == 0) {
         free(g_pcm);
@@ -373,7 +354,6 @@ typedef struct Av3aJob {
     unsigned total_frames, frames_done;
     unsigned long long capacity, produced;
     char src_path[MAX_PATH];
-    char es_path[MAX_PATH];
     unsigned char* buf;
 } Av3aJob;
 
@@ -403,25 +383,25 @@ static unsigned mp4_sample_count(const char* src)
 static DWORD WINAPI av3a_job_thread(LPVOID param)
 {
     Av3aJob* st = (Av3aJob*)param;
-    FILE* fIn = NULL, *fOut = NULL, *fModel = NULL;
+    size_t es_size = 0;
+    unsigned char* es = extract_es_mem(st->src_path, &es_size);
     AVS3DecoderHandle dec = NULL;
     short* pcm = NULL;
     short* stereo = NULL;
-    char tmppath[MAX_PATH];
+    FILE* fModel = NULL;
     PostState post;
 
-    if (extract_es(st->src_path, st->es_path) != 0) { }
-    snprintf(tmppath, sizeof(tmppath), "%s.nul", st->es_path);
+    if (!es) {
+        InterlockedExchange(&st->eof, 1);
+        return 0;
+    }
 
-    dec = (AVS3DecoderHandle)malloc(sizeof(AVS3Decoder));
+    dec = (AVS3DecoderHandle)calloc(1, sizeof(AVS3Decoder));
     if (dec) {
-        char* dargv[5];
-        dargv[0] = (char*)"av3a_stream";
-        dargv[1] = (char*)"-if";
-        dargv[2] = st->es_path;
-        dargv[3] = (char*)"-of";
-        dargv[4] = tmppath;
-        GetAvs3DecoderCommandLine(dec, 5, dargv, &fIn, &fOut);
+        dec->memData = es;
+        dec->memSize = (unsigned long)es_size;
+        dec->memPos = 0;
+        Avs3ParseBsFrameHeader(dec, NULL, 1, NULL);
         Avs3InitDecoder(dec, &fModel);
         pcm = (short*)malloc(sizeof(short) * MAX_CHANNELS * FRAME_LEN);
         stereo = (short*)malloc(sizeof(short) * dec->frameLength * 2);
@@ -430,7 +410,7 @@ static DWORD WINAPI av3a_job_thread(LPVOID param)
     }
 
     post_init(&post, OUT_RATE);
-    while (!st->stop && pcm && stereo && ReadBitstream(dec, fIn) != 0) {
+    while (!st->stop && pcm && stereo && ReadBitstream(dec, NULL) != 0) {
         unsigned bytes = (unsigned)st->frame_len * 2 * sizeof(short);
         Avs3Decode(dec, pcm);
         ResetBitstream(dec->hBitstream);
@@ -444,14 +424,11 @@ static DWORD WINAPI av3a_job_thread(LPVOID param)
         LeaveCriticalSection(&g_job_cs);
     }
 
-    if (fIn) fclose(fIn);
-    if (fOut) fclose(fOut);
     if (fModel) fclose(fModel);
     free(pcm);
     free(stereo);
     free(dec);
-    DeleteFileA(st->es_path);
-    DeleteFileA(tmppath);
+    free(es);
 
     InterlockedExchange(&st->eof, 1);
     return 0;
@@ -494,10 +471,6 @@ EXPORT void* av3a_stream_open(const wchar_t* path)
     g_job.produced = 44;
     g_job.frame_len = 1024;
     g_job.channels = 12;
-
-    char tmpdir[MAX_PATH];
-    GetTempPathA(MAX_PATH, tmpdir);
-    snprintf(g_job.es_path, sizeof(g_job.es_path), "%sav3a_job_%lu.av3a", tmpdir, (unsigned long)GetCurrentProcessId());
 
     unsigned char* buf = (unsigned char*)calloc(1, (size_t)total);
     if (!buf) return NULL;
