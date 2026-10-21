@@ -153,56 +153,104 @@ static unsigned char* extract_es_mem(const char* src, size_t* out_size)
     return out;
 }
 
-/* simple output gain + clamp for the matrix downmix */
-typedef struct { float gain; float env[2]; float rel; } PostState;
+/*
+ * Stereo rendering copied from the NetEase CloudMusic ear::VIVIDRender
+ * panner (1000 Hz.. panner gains measured from the running client):
+ *
+ *   L = g*(FL + C + LFE) + s*(BL - BR + SL + SR + TopL-front + TopL-back)
+ *   R = g*(FR + C + LFE) + s*(BR - BL + SL + SR + TopR-front + TopR-back)
+ *
+ * with g = 0.85 and s = g/sqrt(2) = 0.601.  It is a memoryless matrix; the
+ * only dynamics are a look-ahead peak limiter (same latency as the client's
+ * renderer) followed by a hard clamp.
+ */
+#define LIM_LOOKAHEAD 2147
+#define LIM_RELEASE_SEC 0.227f
+#define LIM_SMOOTH 0.6f
+#define LIM_THRESHOLD (32760.0f / 32768.0f)
+
+typedef struct {
+    float ring[2][LIM_LOOKAHEAD];
+    int idx;
+    float gain[2];
+    float env[2];
+    float decay;
+} PostState;
 
 static void post_init(PostState* p, int rate)
 {
-    (void)rate;
-    p->gain = 1.25f;  /* +1.9 dB, tamed by the peak limiter */
-    p->env[0] = p->env[1] = 0.0f;
-    p->rel = expf(-1.0f / (0.15f * rate));
+    memset(p, 0, sizeof(*p));
+    p->gain[0] = p->gain[1] = 1.0f;
+    p->decay = expf(-1.0f / (LIM_RELEASE_SEC * (float)rate));
 }
 
-static void post_process(PostState* p, short* stereo, int frames)
+static float lim_one(PostState* p, int c, float x)
+{
+    float a = x < 0 ? -x : x;
+    float e = p->env[c] * p->decay;
+    if (a > e) e = a;
+    p->env[c] = e;
+    float target = e > LIM_THRESHOLD ? LIM_THRESHOLD / e : 1.0f;
+    p->gain[c] += (1.0f - LIM_SMOOTH) * (target - p->gain[c]);
+    float y = p->gain[c] * p->ring[c][p->idx];
+    p->ring[c][p->idx] = x;
+    return y;
+}
+
+static short to_pcm(float y)
+{
+    if (y > 1.0f) y = 1.0f;
+    if (y < -1.0f) y = -1.0f;
+    return (short)(y * 32767.0f);
+}
+
+static void post_process(PostState* p, const float* in, short* out, int frames)
 {
     for (int i = 0; i < frames; ++i) {
-        float l = stereo[i * 2] / 32768.0f;
-        float r = stereo[i * 2 + 1] / 32768.0f;
-        float m = (l + r) * 0.5f;
-        float s = (l - r) * 0.5f * 0.68f;
-        float lr[2] = { m + s, m - s };
-        for (int c = 0; c < 2; ++c) {
-            int idx = i * 2 + c;
-            float x = lr[c] * p->gain;
-            float a = x < 0 ? -x : x;
-            if (a > p->env[c]) p->env[c] = a; else p->env[c] *= p->rel;
-            float g = p->env[c] > 0.95f ? 0.95f / p->env[c] : 1.0f;
-            x *= g;
-            if (x > 1.0f) x = 1.0f;
-            if (x < -1.0f) x = -1.0f;
-            stereo[idx] = (short)(x * 32767.0f);
-        }
+        float y0 = lim_one(p, 0, in[i * 2]);
+        float y1 = lim_one(p, 1, in[i * 2 + 1]);
+        p->idx = (p->idx + 1) % LIM_LOOKAHEAD;
+        out[i * 2] = to_pcm(y0);
+        out[i * 2 + 1] = to_pcm(y1);
     }
 }
 
-static void downmix(const short *in, int channels, int frames, short *out)
+/* drain the look-ahead delay line with silence at the end of the stream */
+static void post_flush(PostState* p, short* out, int frames)
 {
-    const float g = 0.55f;
+    for (int i = 0; i < frames; ++i) {
+        float y0 = lim_one(p, 0, 0.0f);
+        float y1 = lim_one(p, 1, 0.0f);
+        p->idx = (p->idx + 1) % LIM_LOOKAHEAD;
+        out[i * 2] = to_pcm(y0);
+        out[i * 2 + 1] = to_pcm(y1);
+    }
+}
+
+static void downmix(const short *in, int channels, int frames, float *out)
+{
+    const float g = 0.85f;
+    const float s = g / 1.41421356f;   /* 0.601 */
     for (int i = 0; i < frames; i++) {
-        const short *s = in + (size_t)i * channels;
-        float l = 0, r = 0;
+        const short *v = in + (size_t)i * channels;
+        float l = 0.0f, r = 0.0f;
         if (channels >= 12) {
-            l = s[0] + 0.707f * s[2] + 0.707f * s[4] + 0.707f * s[6] + 0.30f * s[3] + 0.5f * s[8] + 0.5f * s[10];
-            r = s[1] + 0.707f * s[2] + 0.707f * s[5] + 0.707f * s[7] + 0.30f * s[3] + 0.5f * s[9] + 0.5f * s[11];
-        } else if (channels == 2) { l = s[0]; r = s[1]; }
-        else if (channels == 1) { l = r = s[0]; }
-        else { for (int c = 0; c < channels; c++) { if (c & 1) r += s[c] * 0.5f; else l += s[c] * 0.5f; } }
-        l *= g; r *= g;
-        if (l > 32767) l = 32767; if (l < -32768) l = -32768;
-        if (r > 32767) r = 32767; if (r < -32768) r = -32768;
-        out[i * 2] = (short)l;
-        out[i * 2 + 1] = (short)r;
+            l = g * (v[0] + v[2] + v[3]) + s * (v[4] - v[5] + v[6] + v[7] + v[8] + v[10]);
+            r = g * (v[1] + v[2] + v[3]) + s * (v[5] - v[4] + v[6] + v[7] + v[9] + v[11]);
+        } else if (channels >= 10) {
+            l = g * (v[0] + v[2] + v[3]) + s * (v[4] - v[5] + v[6] + v[7] + v[8]);
+            r = g * (v[1] + v[2] + v[3]) + s * (v[5] - v[4] + v[6] + v[7] + v[9]);
+        } else if (channels >= 8) {
+            l = g * (v[0] + v[2] + v[3]) + s * (v[4] - v[5] + v[6] + v[7]);
+            r = g * (v[1] + v[2] + v[3]) + s * (v[5] - v[4] + v[6] + v[7]);
+        } else if (channels >= 6) {
+            l = g * (v[0] + v[2] + v[3]) + s * (v[4] - v[5]);
+            r = g * (v[1] + v[2] + v[3]) + s * (v[5] - v[4]);
+        } else if (channels == 2) { l = v[0]; r = v[1]; }
+        else if (channels == 1) { l = r = v[0]; }
+        else { for (int c = 0; c < channels; c++) { if (c & 1) r += v[c] * 0.5f; else l += v[c] * 0.5f; } }
+        out[i * 2] = l / 32768.0f;
+        out[i * 2 + 1] = r / 32768.0f;
     }
 }
 
@@ -280,11 +328,13 @@ EXPORT int av3a_decode_wav(const wchar_t *path, void **data, unsigned *size)
     int frame_len = dec->frameLength;
     short *pcm = (short *)malloc(sizeof(short) * MAX_CHANNELS * FRAME_LEN);
     short *stereo = (short *)malloc(sizeof(short) * frame_len * 2);
+    float *mix = (float *)malloc(sizeof(float) * frame_len * 2);
     g_pcm = NULL; g_pcm_size = 0; g_pcm_cap = 0;
 
-    if (!pcm || !stereo) {
+    if (!pcm || !stereo || !mix) {
         if (pcm) free(pcm);
         if (stereo) free(stereo);
+        if (mix) free(mix);
         if (fModel) fclose(fModel);
         free(dec);
         free(es);
@@ -296,14 +346,22 @@ EXPORT int av3a_decode_wav(const wchar_t *path, void **data, unsigned *size)
     while (ReadBitstream(dec, NULL) != 0) {
         Avs3Decode(dec, pcm);
         ResetBitstream(dec->hBitstream);
-        downmix(pcm, channels, frame_len, stereo);
-        post_process(&post, stereo, frame_len);
+        downmix(pcm, channels, frame_len, mix);
+        post_process(&post, mix, stereo, frame_len);
         if (pcm_append(stereo, (size_t)frame_len * 2) != 0) break;
+    }
+    /* drain the limiter's look-ahead delay line */
+    for (int left = LIM_LOOKAHEAD; left > 0; ) {
+        int n = left < frame_len ? left : frame_len;
+        post_flush(&post, stereo, n);
+        if (pcm_append(stereo, (size_t)n * 2) != 0) break;
+        left -= n;
     }
 
     if (fModel) fclose(fModel);
     free(pcm);
     free(stereo);
+    free(mix);
     free(dec);
     free(es);
 
@@ -388,6 +446,7 @@ static DWORD WINAPI av3a_job_thread(LPVOID param)
     AVS3DecoderHandle dec = NULL;
     short* pcm = NULL;
     short* stereo = NULL;
+    float* mix = NULL;
     FILE* fModel = NULL;
     PostState post;
 
@@ -405,17 +464,18 @@ static DWORD WINAPI av3a_job_thread(LPVOID param)
         Avs3InitDecoder(dec, &fModel);
         pcm = (short*)malloc(sizeof(short) * MAX_CHANNELS * FRAME_LEN);
         stereo = (short*)malloc(sizeof(short) * dec->frameLength * 2);
+        mix = (float*)malloc(sizeof(float) * dec->frameLength * 2);
         st->channels = dec->numChansOutput;
         st->frame_len = dec->frameLength;
     }
 
     post_init(&post, OUT_RATE);
-    while (!st->stop && pcm && stereo && ReadBitstream(dec, NULL) != 0) {
+    while (!st->stop && pcm && stereo && mix && ReadBitstream(dec, NULL) != 0) {
         unsigned bytes = (unsigned)st->frame_len * 2 * sizeof(short);
         Avs3Decode(dec, pcm);
         ResetBitstream(dec->hBitstream);
-        downmix(pcm, st->channels, st->frame_len, stereo);
-        post_process(&post, stereo, st->frame_len);
+        downmix(pcm, st->channels, st->frame_len, mix);
+        post_process(&post, mix, stereo, st->frame_len);
         if (st->produced + bytes > st->capacity) break;
         EnterCriticalSection(&g_job_cs);
         memcpy(st->buf + st->produced, stereo, bytes);
@@ -424,9 +484,23 @@ static DWORD WINAPI av3a_job_thread(LPVOID param)
         LeaveCriticalSection(&g_job_cs);
     }
 
+    /* drain the look-ahead delay line if the caller reserved room for it */
+    for (int to_flush = LIM_LOOKAHEAD; !st->stop && stereo && to_flush > 0; ) {
+        int n = to_flush < st->frame_len ? to_flush : st->frame_len;
+        unsigned bytes = (unsigned)n * 2 * sizeof(short);
+        if (st->produced + bytes > st->capacity) break;
+        post_flush(&post, stereo, n);
+        EnterCriticalSection(&g_job_cs);
+        memcpy(st->buf + st->produced, stereo, bytes);
+        st->produced += bytes;
+        LeaveCriticalSection(&g_job_cs);
+        to_flush -= n;
+    }
+
     if (fModel) fclose(fModel);
     free(pcm);
     free(stereo);
+    free(mix);
     free(dec);
     free(es);
 
@@ -463,7 +537,8 @@ EXPORT void* av3a_stream_open(const wchar_t* path)
     unsigned frames = mp4_sample_count(src);
     if (frames == 0) return NULL;
 
-    unsigned long long pcm_bytes = (unsigned long long)frames * 1024 * OUT_CH * sizeof(short);
+    unsigned long long pcm_frames = (unsigned long long)frames * 1024 + LIM_LOOKAHEAD;
+    unsigned long long pcm_bytes = pcm_frames * OUT_CH * sizeof(short);
     unsigned long long total = 44 + pcm_bytes;
 
     strncpy(g_job.src_path, src, MAX_PATH - 1);
