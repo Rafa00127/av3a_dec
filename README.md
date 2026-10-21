@@ -48,19 +48,31 @@ DLL 会在自身目录依次查找 `model.bin`、`vivid_model.bin`，任选其�
 
 ```c
 int            av3a_probe(const wchar_t* path);                 // 1 = av3a m4a
-const wchar_t* av3a_prepare(const wchar_t* path);               // 返回可播放 WAV 路径
-void           av3a_cleanup(void);                              // 清理临时文件
 int            av3a_decode_wav(const wchar_t* path, void** data, unsigned* size);
 void           av3a_free(void* data);
+
+void*          av3a_stream_open(const wchar_t* path);           // 边解边播
+unsigned long long av3a_stream_length(void* h);                 // 虚拟文件长度
+int            av3a_stream_read(void* h, void* buf, unsigned len, unsigned long long offset);
+void           av3a_stream_close(void* h);
 ```
 
-`av3a_prepare` 为流式实现：先返回一个边解码边写入的 WAV，调用方用 BASS 等
-播放器打开即可；解码完成后会缓存到 `%LOCALAPPDATA%\av3a_cache`。
+`av3a_stream_*` 是推荐用法：对外表现为一个完整的 WAV（44 字节头 + PCM），
+内部只保留**播放点前后几秒的窗口**（默认 6 秒），按需解码；任意位置可以
+立即 seek（跳到目标帧前 8 帧预滚后继续），与 BASS 的 `BASS_StreamCreateFileUser`
+配合即可，无需临时文件、也不再需要整首缓冲。
+
+立体声输出与网易云客户端 `ear::VIVIDRender` 实测一致：12 声道按
+`g=0.85 / s=g/√2` 的固定矩阵下混（FL/FR 硬声像、C 与 LFE 满增益进两侧、
+环绕与顶部 0.707g、ch4/ch5 以差信号反向进入），随后是 2147 样本前瞻的
+峰值限幅器（阈值 ≈32760、释放 227ms、增益平滑 0.6）和硬钳位。
 
 ## 格式说明
 
 - MP4 sample entry：`av3a`；裸流扩展名 `.av3a`
-- 帧长固定 1024 样本，支持 7.1.4 等声道配置
+- 采样率与帧长从首帧头读取（参考实现帧长恒为 1024）；目前 7.1.4 下混已校准，
+  5.1 / HOA 走同构近似
+- 只支持普通 MP4（`stsc/stsz/stco|co64`）；fMP4（`moof/traf/trun`）暂不支持
 - 文件可带 `dca3` 配置盒，也可只靠 ES 帧头（网易云下载的文件属于后者）
 
 ## 许可

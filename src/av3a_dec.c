@@ -404,127 +404,240 @@ EXPORT void av3a_free(void *data)
 
 
 /* ------------------------------------------------------------------ */
-/* progressive WAV file + background decode                            */
 /* ------------------------------------------------------------------ */
+/* windowed streaming: decode on demand, seek like the client          */
+/* ------------------------------------------------------------------ */
+#define WIN_SECONDS 6
+#define AHEAD_SECONDS 4
+#define PREROLL_FRAMES 8
+
 typedef struct Av3aJob {
     HANDLE thread;
     volatile LONG stop;
     volatile LONG eof;
+
     int channels, frame_len, out_rate;
-    unsigned total_frames, frames_done;
-    unsigned long long capacity, produced;
+    unsigned total_frames;
+    unsigned long long total_samples;
+    unsigned long long capacity;
+
+    /* frame -> byte offset into the elementary stream */
+    const unsigned char* es;
+    unsigned long long es_size;
+    unsigned* frame_off;      /* prefix sums, total_frames + 1 entries */
+    unsigned frame_bytes;     /* constant sample size, 0 if variable */
+
+    /* decoded window: interleaved stereo int16 (virtual absolute samples) */
+    short* win;
+    unsigned long long win_samples;
+    unsigned long long win_base;
+    unsigned long long win_valid;
+
+    /* reader state */
+    unsigned long long want;
+    volatile LONG dirty;
+
+    unsigned char header[44];
     char src_path[MAX_PATH];
-    unsigned char* buf;
+    volatile LONG frames_decoded;
 } Av3aJob;
 
 static Av3aJob g_job;
 static CRITICAL_SECTION g_job_cs;
 static LONG g_job_cs_ready = 0;
-static WCHAR g_return_path[MAX_PATH];
 
-static unsigned mp4_sample_count(const char* src)
+/* stsz sample sizes -> prefix sum table (NULL when the size is constant) */
+static unsigned* mp4_frame_table(const char* src, unsigned* count, unsigned* fixed, unsigned long long* es_size)
 {
     FILE* f = fopen(src, "rb");
-    if (!f) return 0;
+    if (!f) return NULL;
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
     unsigned char* d = (unsigned char*)malloc((size_t)n);
-    if (!d) { fclose(f); return 0; }
-    if (fread(d, 1, (size_t)n, f) != (size_t)n) { free(d); fclose(f); return 0; }
+    if (!d) { fclose(f); return NULL; }
+    if (fread(d, 1, (size_t)n, f) != (size_t)n) { free(d); fclose(f); return NULL; }
     fclose(f);
-    unsigned count = 0;
+
+    unsigned* table = NULL;
     const unsigned char* stsz = find_box(d, d + n, "stsz", 0);
-    if (stsz) count = be32(stsz + 16);
+    if (stsz) {
+        unsigned fx = be32(stsz + 12);
+        unsigned cnt = be32(stsz + 16);
+        *count = cnt;
+        *fixed = fx;
+        const unsigned char* sizes = stsz + 20;
+        table = (unsigned*)malloc(sizeof(unsigned) * ((size_t)cnt + 1));
+        if (table) {
+            unsigned long long sum = 0;
+            for (unsigned i = 0; i < cnt; ++i) {
+                table[i] = (unsigned)sum;
+                sum += fx ? fx : be32(sizes + (size_t)i * 4);
+            }
+            table[cnt] = (unsigned)sum;
+            *es_size = sum;
+        }
+    }
     free(d);
-    return count;
+    return table;
 }
 
-/* read frame length and sample rate from the first frame header */
-static int probe_stream_format(const char* src, int* frame_len, int* out_rate)
+static unsigned long long frame_offset(Av3aJob* st, unsigned frame)
 {
-    size_t es_size = 0;
-    unsigned char* es = extract_es_mem(src, &es_size);
-    if (!es) return 0;
-    AVS3DecoderHandle probe = (AVS3DecoderHandle)calloc(1, sizeof(AVS3Decoder));
-    if (!probe) { free(es); return 0; }
-    probe->memData = es;
-    probe->memSize = (unsigned long)es_size;
-    probe->memPos = 0;
-    Avs3ParseBsFrameHeader(probe, NULL, 1, NULL);
-    if (probe->frameLength > 0) *frame_len = probe->frameLength;
-    if (probe->outputFs > 0) *out_rate = (int)probe->outputFs;
-    free(probe);
-    free(es);
+    if (frame > st->total_frames) frame = st->total_frames;
+    if (st->frame_off) return st->frame_off[frame];
+    return (unsigned long long)frame * st->frame_bytes;
+}
+
+static void post_reset(PostState* p, int rate)
+{
+    post_init(p, rate);
+}
+
+static void job_decoder_close(AVS3DecoderHandle* dec, FILE** fModel)
+{
+    if (*fModel) { fclose(*fModel); *fModel = NULL; }
+    if (*dec) { free(*dec); *dec = NULL; }
+}
+
+/* (re)start the decoder so that output sample `base` is the first one written */
+static int job_seek_decoder(Av3aJob* st, AVS3DecoderHandle* dec, FILE** fModel, PostState* post,
+                            unsigned long long base, unsigned long long* out_abs)
+{
+    job_decoder_close(dec, fModel);
+    post_reset(post, st->out_rate);
+
+    unsigned long long first_frame = base / (unsigned)st->frame_len;
+    unsigned start_frame = first_frame > PREROLL_FRAMES ? (unsigned)(first_frame - PREROLL_FRAMES) : 0;
+
+    AVS3DecoderHandle d = (AVS3DecoderHandle)calloc(1, sizeof(AVS3Decoder));
+    if (!d) return 0;
+    d->memData = (unsigned char*)st->es;
+    d->memSize = (unsigned long)st->es_size;
+    d->memPos = 0;
+
+    FILE* fm = NULL;
+    Avs3ParseBsFrameHeader(d, NULL, 1, NULL);   /* config from frame 0, rewinds */
+    Avs3InitDecoder(d, &fm);
+    /* jump must happen after the init, which rewinds to the stream start */
+    d->memPos = (unsigned long)frame_offset(st, start_frame);
+    ResetBitstream(d->hBitstream);
+    if (d->numChansOutput != st->channels || d->frameLength != st->frame_len) {
+        /* streams with a different config are not supported mid-stream */
+        if (fm) fclose(fm);
+        free(d);
+        return 0;
+    }
+    *dec = d;
+    *fModel = fm;
+    *out_abs = (unsigned long long)start_frame * (unsigned)st->frame_len;
+    return 1;
+}
+
+/* drop decoded samples the reader has already passed */
+static int win_compact(Av3aJob* st)
+{
+    unsigned long long keep = (st->want / (unsigned)st->frame_len) * (unsigned)st->frame_len;
+    if (st->win_valid == 0) { st->win_base = keep > st->win_base ? keep : st->win_base; return 1; }
+    if (keep <= st->win_base) return 0;
+    unsigned long long drop = keep - st->win_base;
+    if (drop >= st->win_valid) {
+        st->win_base = keep;
+        st->win_valid = 0;
+        return 1;
+    }
+    memmove(st->win, st->win + drop * 2, (size_t)(st->win_valid - drop) * sizeof(short) * 2);
+    st->win_base = keep;
+    st->win_valid -= drop;
     return 1;
 }
 
 static DWORD WINAPI av3a_job_thread(LPVOID param)
 {
     Av3aJob* st = (Av3aJob*)param;
-    size_t es_size = 0;
-    unsigned char* es = extract_es_mem(st->src_path, &es_size);
     AVS3DecoderHandle dec = NULL;
-    short* pcm = NULL;
-    short* stereo = NULL;
-    float* mix = NULL;
     FILE* fModel = NULL;
     PostState post;
+    unsigned long long out_abs = 0;
+    short* pcm = (short*)malloc(sizeof(short) * MAX_CHANNELS * FRAME_LEN);
+    short* out = (short*)malloc(sizeof(short) * st->frame_len * 2);
+    float* mix = (float*)malloc(sizeof(float) * st->frame_len * 2);
+    int seeded = 0;
 
-    if (!es) {
+    if (!pcm || !out || !mix) {
         InterlockedExchange(&st->eof, 1);
+        free(pcm); free(out); free(mix);
         return 0;
     }
 
-    dec = (AVS3DecoderHandle)calloc(1, sizeof(AVS3Decoder));
-    if (dec) {
-        dec->memData = es;
-        dec->memSize = (unsigned long)es_size;
-        dec->memPos = 0;
-        Avs3ParseBsFrameHeader(dec, NULL, 1, NULL);
-        Avs3InitDecoder(dec, &fModel);
-        pcm = (short*)malloc(sizeof(short) * MAX_CHANNELS * FRAME_LEN);
-        stereo = (short*)malloc(sizeof(short) * dec->frameLength * 2);
-        mix = (float*)malloc(sizeof(float) * dec->frameLength * 2);
-        st->channels = dec->numChansOutput;
-        st->frame_len = dec->frameLength;
-    }
+    while (!st->stop) {
+        unsigned long long want, valid_end;
+        int jump, space;
+        EnterCriticalSection(&g_job_cs);
+        want = st->want;
+        jump = (int)st->dirty;
+        st->dirty = 0;
+        valid_end = st->win_base + st->win_valid;
+        LeaveCriticalSection(&g_job_cs);
 
-    post_init(&post, st->out_rate > 0 ? st->out_rate : OUT_RATE);
-    while (!st->stop && pcm && stereo && mix && ReadBitstream(dec, NULL) != 0) {
-        unsigned bytes = (unsigned)st->frame_len * 2 * sizeof(short);
+        if (jump || !dec || !seeded) {
+            unsigned long long base = (want / (unsigned)st->frame_len) * (unsigned)st->frame_len;
+            if (!job_seek_decoder(st, &dec, &fModel, &post, base, &out_abs)) {
+                InterlockedExchange(&st->eof, 1);
+                break;
+            }
+            EnterCriticalSection(&g_job_cs);
+            st->win_base = base;
+            st->win_valid = 0;
+            LeaveCriticalSection(&g_job_cs);
+            seeded = 1;
+        } else if (want + (unsigned long long)(AHEAD_SECONDS * st->out_rate) <= valid_end) {
+            Sleep(4);
+            continue;
+        }
+
+        EnterCriticalSection(&g_job_cs);
+        if (st->win_valid + (unsigned long long)st->frame_len > st->win_samples) win_compact(st);
+        space = (st->win_valid + (unsigned long long)st->frame_len <= st->win_samples);
+        LeaveCriticalSection(&g_job_cs);
+        if (!space) { Sleep(4); continue; }
+
+        if (ReadBitstream(dec, NULL) == 0) {
+            InterlockedExchange(&st->eof, 1);
+            /* idle until the reader seeks somewhere else */
+            while (!st->stop && !st->dirty) Sleep(5);
+            if (st->stop) break;
+            InterlockedExchange(&st->eof, 0);
+            continue;
+        }
         Avs3Decode(dec, pcm);
+        InterlockedIncrement(&st->frames_decoded);
         ResetBitstream(dec->hBitstream);
         downmix(pcm, st->channels, st->frame_len, mix);
-        post_process(&post, mix, stereo, st->frame_len);
-        if (st->produced + bytes > st->capacity) break;
+        post_process(&post, mix, out, st->frame_len);
+
         EnterCriticalSection(&g_job_cs);
-        memcpy(st->buf + st->produced, stereo, bytes);
-        st->produced += bytes;
-        st->frames_done++;
+        if (out_abs < st->total_samples && out_abs + (unsigned long long)st->frame_len > st->win_base) {
+            unsigned long long start = out_abs > st->win_base ? out_abs : st->win_base;
+            unsigned long long stop = out_abs + (unsigned long long)st->frame_len;
+            if (stop > st->win_base + st->win_samples) stop = st->win_base + st->win_samples;
+            if (stop > st->total_samples) stop = st->total_samples;
+            if (stop > start) {
+                unsigned skip = (unsigned)(start - out_abs);
+                unsigned n = (unsigned)(stop - start);
+                memcpy(st->win + (size_t)(start - st->win_base) * 2, out + skip * 2, (size_t)n * sizeof(short) * 2);
+                if (start + n > st->win_base + st->win_valid)
+                    st->win_valid = start + n - st->win_base;
+            }
+        }
         LeaveCriticalSection(&g_job_cs);
+        out_abs += (unsigned long long)st->frame_len;
     }
 
-    /* drain the look-ahead delay line if the caller reserved room for it */
-    for (int to_flush = LIM_LOOKAHEAD; !st->stop && stereo && to_flush > 0; ) {
-        int n = to_flush < st->frame_len ? to_flush : st->frame_len;
-        unsigned bytes = (unsigned)n * 2 * sizeof(short);
-        if (st->produced + bytes > st->capacity) break;
-        post_flush(&post, stereo, n);
-        EnterCriticalSection(&g_job_cs);
-        memcpy(st->buf + st->produced, stereo, bytes);
-        st->produced += bytes;
-        LeaveCriticalSection(&g_job_cs);
-        to_flush -= n;
-    }
-
-    if (fModel) fclose(fModel);
+    job_decoder_close(&dec, &fModel);
     free(pcm);
-    free(stereo);
+    free(out);
     free(mix);
-    free(dec);
-    free(es);
-
     InterlockedExchange(&st->eof, 1);
     return 0;
 }
@@ -539,7 +652,9 @@ static void av3a_job_stop(void)
         g_job.thread = NULL;
     }
     EnterCriticalSection(&g_job_cs);
-    free(g_job.buf);
+    free(g_job.win);
+    free(g_job.frame_off);
+    free((void*)g_job.es);
     memset(&g_job, 0, sizeof(g_job));
     LeaveCriticalSection(&g_job_cs);
 }
@@ -552,33 +667,63 @@ EXPORT void* av3a_stream_open(const wchar_t* path)
             InitializeCriticalSection(&g_job_cs);
     }
     av3a_job_stop();
+    resolve_model();
 
     char src[MAX_PATH];
     WideCharToMultiByte(CP_ACP, 0, path, -1, src, MAX_PATH, NULL, NULL);
-    unsigned frames = mp4_sample_count(src);
-    if (frames == 0) return NULL;
+
+    unsigned frames = 0, fixed = 0;
+    unsigned long long es_size = 0;
+    unsigned* table = mp4_frame_table(src, &frames, &fixed, &es_size);
+    if (!table || frames == 0) { free(table); return NULL; }
+
+    size_t es_read = 0;
+    unsigned char* es = extract_es_mem(src, &es_read);
+    if (!es) { free(table); return NULL; }
 
     int frame_len = 1024, out_rate = OUT_RATE;
-    if (!probe_stream_format(src, &frame_len, &out_rate)) return NULL;
+    {
+        AVS3DecoderHandle probe = (AVS3DecoderHandle)calloc(1, sizeof(AVS3Decoder));
+        if (!probe) { free(es); free(table); return NULL; }
+        probe->memData = es;
+        probe->memSize = (unsigned long)es_read;
+        probe->memPos = 0;
+        Avs3ParseBsFrameHeader(probe, NULL, 1, NULL);
+        if (probe->frameLength > 0) frame_len = probe->frameLength;
+        if (probe->outputFs > 0) out_rate = (int)probe->outputFs;
+        free(probe);
+    }
 
-    unsigned long long pcm_frames = (unsigned long long)frames * (unsigned)frame_len + LIM_LOOKAHEAD;
-    unsigned long long pcm_bytes = pcm_frames * OUT_CH * sizeof(short);
-    unsigned long long total = 44 + pcm_bytes;
+    unsigned long long total_samples = (unsigned long long)frames * (unsigned)frame_len;
+    unsigned long long capacity = 44 + total_samples * OUT_CH * sizeof(short);
+
+    unsigned long long win_samples = (unsigned long long)out_rate * WIN_SECONDS;
+    if (win_samples < (unsigned long long)frame_len * 64) win_samples = (unsigned long long)frame_len * 64;
+
+    short* win = (short*)malloc((size_t)win_samples * OUT_CH * sizeof(short));
+    if (!win) { free(es); free(table); return NULL; }
 
     strncpy(g_job.src_path, src, MAX_PATH - 1);
-    g_job.capacity = total;
-    g_job.produced = 44;
+    g_job.es = es;
+    g_job.es_size = es_read;
+    g_job.frame_off = table;
+    g_job.frame_bytes = fixed;
+    g_job.total_frames = frames;
+    g_job.total_samples = total_samples;
+    g_job.capacity = capacity;
     g_job.frame_len = frame_len;
     g_job.out_rate = out_rate;
     g_job.channels = 12;
+    g_job.win = win;
+    g_job.win_samples = win_samples;
+    g_job.win_base = 0;
+    g_job.win_valid = 0;
+    g_job.want = 0;
+    g_job.dirty = 0;
 
-    unsigned char* buf = (unsigned char*)calloc(1, (size_t)total);
-    if (!buf) return NULL;
-    g_job.buf = buf;
-
-    unsigned char* h = buf;
+    unsigned char* h = g_job.header;
     memcpy(h, "RIFF", 4);
-    put_le32(h + 4, (unsigned)(36 + pcm_bytes));
+    put_le32(h + 4, (unsigned)(36 + total_samples * OUT_CH * sizeof(short)));
     memcpy(h + 8, "WAVEfmt ", 8);
     put_le32(h + 16, 16);
     put_le16(h + 20, 1);
@@ -588,16 +733,25 @@ EXPORT void* av3a_stream_open(const wchar_t* path)
     put_le16(h + 32, OUT_CH * 2);
     put_le16(h + 34, 16);
     memcpy(h + 36, "data", 4);
-    put_le32(h + 40, (unsigned)pcm_bytes);
+    put_le32(h + 40, (unsigned)(total_samples * OUT_CH * sizeof(short)));
 
     g_job.thread = CreateThread(NULL, 0, av3a_job_thread, &g_job, 0, NULL);
     if (!g_job.thread) {
-        free(g_job.buf);
+        free(g_job.win); g_job.win = NULL;
+        free(g_job.frame_off); g_job.frame_off = NULL;
+        free(es); g_job.es = NULL;
         memset(&g_job, 0, sizeof(g_job));
         return NULL;
     }
 
-    while (!g_job.eof && g_job.produced < 44 + (unsigned long long)out_rate * OUT_CH * 2 * 2) {
+    /* wait for the initial buffer */
+    unsigned long long pre = (unsigned long long)out_rate * OUT_CH * sizeof(short) * 2;
+    for (;;) {
+        unsigned long long have;
+        EnterCriticalSection(&g_job_cs);
+        have = g_job.win_valid * OUT_CH * sizeof(short);
+        LeaveCriticalSection(&g_job_cs);
+        if (g_job.eof || have >= pre) break;
         Sleep(10);
     }
     return &g_job;
@@ -609,15 +763,89 @@ EXPORT unsigned long long av3a_stream_length(void* handle)
     return st ? st->capacity : 0;
 }
 
+/* block until [s, s+n) is decoded */
+static int job_wait_range(Av3aJob* st, unsigned long long s, unsigned long long n)
+{
+    DWORD t0 = GetTickCount();
+    for (;;) {
+        EnterCriticalSection(&g_job_cs);
+        unsigned long long end = st->win_base + st->win_valid;
+        int ok = (s >= st->win_base && s + n <= end);
+        if (!ok) {
+            st->want = s;
+            if (s < st->win_base || s >= st->win_base + st->win_samples)
+                st->dirty = 1;
+        }
+        LeaveCriticalSection(&g_job_cs);
+        if (ok) return 1;
+        if (st->stop) return 0;
+        if (GetTickCount() - t0 > 4000) return 0;
+        Sleep(1);
+    }
+}
+
 EXPORT int av3a_stream_read(void* handle, void* buf, unsigned len, unsigned long long offset)
 {
     Av3aJob* st = (Av3aJob*)handle;
-    if (!st || !buf || !st->buf) return 0;
+    if (!st || !buf || len == 0) return 0;
     if (offset >= st->capacity) return 0;
     unsigned long long end = offset + len;
     if (end > st->capacity) end = st->capacity;
-    memcpy(buf, st->buf + offset, (size_t)(end - offset));
-    return (int)(end - offset);
+
+    unsigned char* dst = (unsigned char*)buf;
+    unsigned got = 0;
+
+    while (offset < end) {
+        if (offset < 44) {
+            unsigned long long take = 44 - offset;
+            if (take > end - offset) take = end - offset;
+            memcpy(dst + got, st->header + offset, (size_t)take);
+            got += (unsigned)take;
+            offset += take;
+            continue;
+        }
+        unsigned long long pcm_off = offset - 44;
+        unsigned long long sample = pcm_off / (OUT_CH * sizeof(short));
+        unsigned long long byte_in_sample = pcm_off % (OUT_CH * sizeof(short));
+        unsigned long long remaining = end - offset;
+        unsigned long long max_bytes = (st->win_samples / 2) * OUT_CH * sizeof(short);
+        if (remaining > max_bytes) remaining = max_bytes;
+        unsigned long long samples_needed = (byte_in_sample + remaining + OUT_CH * sizeof(short) - 1) / (OUT_CH * sizeof(short));
+
+        if (!job_wait_range(st, sample, samples_needed)) return (int)got;
+
+        EnterCriticalSection(&g_job_cs);
+        unsigned long long avail_end = st->win_base + st->win_valid;
+        unsigned long long take_samples = samples_needed;
+        if (sample + take_samples > avail_end) take_samples = avail_end > sample ? avail_end - sample : 0;
+        if (take_samples > 0) {
+            const unsigned char* src = (const unsigned char*)(st->win + (size_t)(sample - st->win_base) * 2);
+            unsigned long long bytes = (unsigned long long)take_samples * OUT_CH * sizeof(short) - byte_in_sample;
+            if (bytes > remaining) bytes = remaining;
+            memcpy(dst + got, src + byte_in_sample, (size_t)bytes);
+            got += (unsigned)bytes;
+            offset += bytes;
+        }
+        LeaveCriticalSection(&g_job_cs);
+        if (take_samples == 0) return (int)got;
+    }
+    return (int)got;
+}
+
+EXPORT void av3a_stream_debug(void* handle, unsigned long long* out)
+{
+    Av3aJob* st = (Av3aJob*)handle;
+    if (!st || !out) return;
+    EnterCriticalSection(&g_job_cs);
+    out[0] = st->win_base;
+    out[1] = st->win_valid;
+    out[2] = st->want;
+    out[3] = (unsigned long long)st->dirty;
+    out[4] = (unsigned long long)st->eof;
+    out[5] = (unsigned long long)st->stop;
+    out[6] = st->total_samples;
+    out[7] = (unsigned long long)st->frames_decoded;
+    LeaveCriticalSection(&g_job_cs);
 }
 
 EXPORT void av3a_stream_close(void* handle)
