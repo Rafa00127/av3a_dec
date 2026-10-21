@@ -326,6 +326,8 @@ EXPORT int av3a_decode_wav(const wchar_t *path, void **data, unsigned *size)
 
     int channels = dec->numChansOutput;
     int frame_len = dec->frameLength;
+    int out_rate = (int)dec->outputFs;
+    if (out_rate <= 0) out_rate = OUT_RATE;
     short *pcm = (short *)malloc(sizeof(short) * MAX_CHANNELS * FRAME_LEN);
     short *stereo = (short *)malloc(sizeof(short) * frame_len * 2);
     float *mix = (float *)malloc(sizeof(float) * frame_len * 2);
@@ -342,7 +344,7 @@ EXPORT int av3a_decode_wav(const wchar_t *path, void **data, unsigned *size)
     }
 
     PostState post;
-    post_init(&post, OUT_RATE);
+    post_init(&post, out_rate);
     while (ReadBitstream(dec, NULL) != 0) {
         Avs3Decode(dec, pcm);
         ResetBitstream(dec->hBitstream);
@@ -380,8 +382,8 @@ EXPORT int av3a_decode_wav(const wchar_t *path, void **data, unsigned *size)
     put_le32(h + 16, 16);
     put_le16(h + 20, 1);
     put_le16(h + 22, OUT_CH);
-    put_le32(h + 24, OUT_RATE);
-    put_le32(h + 28, OUT_RATE * OUT_CH * 2);
+    put_le32(h + 24, (unsigned)out_rate);
+    put_le32(h + 28, (unsigned)out_rate * OUT_CH * 2);
     put_le16(h + 32, OUT_CH * 2);
     put_le16(h + 34, 16);
     memcpy(h + 36, "data", 4);
@@ -408,7 +410,7 @@ typedef struct Av3aJob {
     HANDLE thread;
     volatile LONG stop;
     volatile LONG eof;
-    int channels, frame_len;
+    int channels, frame_len, out_rate;
     unsigned total_frames, frames_done;
     unsigned long long capacity, produced;
     char src_path[MAX_PATH];
@@ -436,6 +438,25 @@ static unsigned mp4_sample_count(const char* src)
     if (stsz) count = be32(stsz + 16);
     free(d);
     return count;
+}
+
+/* read frame length and sample rate from the first frame header */
+static int probe_stream_format(const char* src, int* frame_len, int* out_rate)
+{
+    size_t es_size = 0;
+    unsigned char* es = extract_es_mem(src, &es_size);
+    if (!es) return 0;
+    AVS3DecoderHandle probe = (AVS3DecoderHandle)calloc(1, sizeof(AVS3Decoder));
+    if (!probe) { free(es); return 0; }
+    probe->memData = es;
+    probe->memSize = (unsigned long)es_size;
+    probe->memPos = 0;
+    Avs3ParseBsFrameHeader(probe, NULL, 1, NULL);
+    if (probe->frameLength > 0) *frame_len = probe->frameLength;
+    if (probe->outputFs > 0) *out_rate = (int)probe->outputFs;
+    free(probe);
+    free(es);
+    return 1;
 }
 
 static DWORD WINAPI av3a_job_thread(LPVOID param)
@@ -469,7 +490,7 @@ static DWORD WINAPI av3a_job_thread(LPVOID param)
         st->frame_len = dec->frameLength;
     }
 
-    post_init(&post, OUT_RATE);
+    post_init(&post, st->out_rate > 0 ? st->out_rate : OUT_RATE);
     while (!st->stop && pcm && stereo && mix && ReadBitstream(dec, NULL) != 0) {
         unsigned bytes = (unsigned)st->frame_len * 2 * sizeof(short);
         Avs3Decode(dec, pcm);
@@ -537,14 +558,18 @@ EXPORT void* av3a_stream_open(const wchar_t* path)
     unsigned frames = mp4_sample_count(src);
     if (frames == 0) return NULL;
 
-    unsigned long long pcm_frames = (unsigned long long)frames * 1024 + LIM_LOOKAHEAD;
+    int frame_len = 1024, out_rate = OUT_RATE;
+    if (!probe_stream_format(src, &frame_len, &out_rate)) return NULL;
+
+    unsigned long long pcm_frames = (unsigned long long)frames * (unsigned)frame_len + LIM_LOOKAHEAD;
     unsigned long long pcm_bytes = pcm_frames * OUT_CH * sizeof(short);
     unsigned long long total = 44 + pcm_bytes;
 
     strncpy(g_job.src_path, src, MAX_PATH - 1);
     g_job.capacity = total;
     g_job.produced = 44;
-    g_job.frame_len = 1024;
+    g_job.frame_len = frame_len;
+    g_job.out_rate = out_rate;
     g_job.channels = 12;
 
     unsigned char* buf = (unsigned char*)calloc(1, (size_t)total);
@@ -558,8 +583,8 @@ EXPORT void* av3a_stream_open(const wchar_t* path)
     put_le32(h + 16, 16);
     put_le16(h + 20, 1);
     put_le16(h + 22, OUT_CH);
-    put_le32(h + 24, OUT_RATE);
-    put_le32(h + 28, OUT_RATE * OUT_CH * 2);
+    put_le32(h + 24, (unsigned)out_rate);
+    put_le32(h + 28, (unsigned)out_rate * OUT_CH * 2);
     put_le16(h + 32, OUT_CH * 2);
     put_le16(h + 34, 16);
     memcpy(h + 36, "data", 4);
@@ -572,7 +597,7 @@ EXPORT void* av3a_stream_open(const wchar_t* path)
         return NULL;
     }
 
-    while (!g_job.eof && g_job.produced < 44 + (unsigned long long)OUT_RATE * OUT_CH * 2 * 2) {
+    while (!g_job.eof && g_job.produced < 44 + (unsigned long long)out_rate * OUT_CH * 2 * 2) {
         Sleep(10);
     }
     return &g_job;
